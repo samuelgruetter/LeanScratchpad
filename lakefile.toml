@@ -1,0 +1,11 @@
+name = "LeanScratchpad"
+version = "0.1.0"
+defaultTargets = ["LeanScratchpad"]
+
+
+[[lean_lib]]
+name = "LeanScratchpad"
+
+[leanOptions]
+autoImplicit = false
+relaxedAutoImplicit = false
