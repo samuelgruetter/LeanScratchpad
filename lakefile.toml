@@ -5,7 +5,3 @@ defaultTargets = ["LeanScratchpad"]
 
 [[lean_lib]]
 name = "LeanScratchpad"
-
-[leanOptions]
-autoImplicit = false
-relaxedAutoImplicit = false
