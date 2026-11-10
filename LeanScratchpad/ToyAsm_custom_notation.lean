@@ -189,9 +189,6 @@ inductive Instr where
   | jnz (cond : Reg) (target : String)
   | halt
 
-structure Program where
-  instrs : List Instr
-
 declare_syntax_cat reg
 notation "[reg| " r:reg "]" in term => r
 notation "❰" e:term "❱" in reg => e
@@ -219,22 +216,31 @@ notation "dec " r:reg in instr => Instr.dec r
 notation "jnz " r:reg ", " l:label in instr => Instr.jnz r l
 notation "halt" in instr => Instr.halt
 
-/-! A program is a sequence of instructions, which `notation ... in c` cannot express (just like
-`notation`), so it is defined directly. Each instruction is printed on its own line. -/
+/-! A program is a non-empty `List Instr`, written `[asm| ... ]` with one instruction per line.
+This is defined directly, because `notation ... in c` (like `notation`) cannot express
+repetition. The printer only handles lists of instructions that end in `[]`; the empty list is
+not affected and is still written `[]`. -/
 
-syntax "[asm|" ppDedent(ppIndent((ppLine instr)*) ppLine) "]" : term
+syntax "[asm|" ppDedent(ppIndent((ppLine instr)+) ppLine) "]" : term
 
 macro_rules
-  | `([asm| $is*]) => `(Program.mk [$[[instr| $is]],*])
+  | `([asm| $is*]) => `(([$[[instr| $is]],*] : List Instr))
 
 open Lean PrettyPrinter Delaborator SubExpr in
-@[delab app.Program.mk] def delabProgram : Delab := do
-  guard ((← getExpr).getAppNumArgs == 1)
-  let `([$is,*]) ← withAppArg delab | failure
-  let is : Array (TSyntax `instr) ←
-    is.getElems.mapM fun i => do
-      let some i := CatNotation.toCat `instr none none (some instr.enter_term.mk) i | failure
-      return ⟨i⟩
+/-- The elements of a list literal `[a, ..., z]`, each shown as an instruction. -/
+partial def delabInstrs : DelabM (Array (TSyntax `instr)) := do
+  let e ← getExpr
+  if e.isAppOfArity ``List.nil 1 then return #[]
+  guard (e.isAppOfArity ``List.cons 3)
+  let some i := CatNotation.toCat `instr none none (some instr.enter_term.mk)
+      (← withNaryArg 1 delab) | failure
+  return #[⟨i⟩] ++ (← withNaryArg 2 delabInstrs)
+
+open Lean PrettyPrinter Delaborator SubExpr in
+@[delab app.List.cons] def delabAsm : Delab := do
+  let e ← getExpr
+  guard (e.isAppOfArity ``List.cons 3 && e.appFn!.appFn!.appArg!.isConstOf ``Instr)
+  let is ← delabInstrs
   `([asm| $[$is]*])
 
 /-! ## Single instructions -/
@@ -279,7 +285,7 @@ def stop : Instr := .halt
 /-- info: [instr| jnz ❰{ idx := answer }❱, done] : Instr -/
 #guard_msgs in #check Instr.jnz ⟨answer⟩ "done"
 
-/-! ## Programs -/
+/-! ## Programs (non-empty `List Instr`) -/
 
 /--
 info: [asm|
@@ -291,7 +297,7 @@ info: [asm|
   dec %1
   jnz %1, loop
   halt
-] : Program
+] : List Instr
 -/
 #guard_msgs in
 #check [asm|
@@ -309,7 +315,7 @@ info: [asm|
 info: [asm|
   mov ❰scratch❱, ❰answer❱
   ❰stop❱
-] : Program
+] : List Instr
 -/
 #guard_msgs in
 #check [asm|
@@ -317,21 +323,40 @@ info: [asm|
   ❰stop❱
 ]
 
+-- Lists built without the syntax are printed with it too.
 /--
 info: [asm|
   start:
   jnz %0, start
-] : Program
+] : List Instr
 -/
 #guard_msgs in
-#check Program.mk [.label "start", .jnz ⟨0⟩ "start"]
+#check ([.label "start", .jnz ⟨0⟩ "start"] : List Instr)
 
 /--
 info: [asm|
-] : Program
+  halt
+] : List Instr
 -/
 #guard_msgs in
-#check [asm|]
+#check [Instr.halt]
+
+-- The empty list, lists of other types, and lists with an unknown tail are printed as usual.
+/-- info: [] : List Instr -/
+#guard_msgs in #check ([] : List Instr)
+
+/-- info: [1, 2] : List Nat -/
+#guard_msgs in #check [1, 2]
+
+/-- info: fun rest => [instr| halt] :: rest : List Instr → List Instr -/
+#guard_msgs in #check fun (rest : List Instr) => Instr.halt :: rest
+
+-- `[asm| ]` is not a way to write the empty list.
+/-- error: <input>:1:6: expected label -/
+#guard_msgs in #eval show Lean.Elab.Command.CommandElabM Unit from do
+  match Lean.Parser.runParserCategory (← Lean.getEnv) `term "[asm| ]" with
+  | .ok _ => pure ()
+  | .error e => throwError e
 
 /-! ## Other concrete syntax for switching categories
 
@@ -395,3 +420,34 @@ def mov (add : Nat) : Nat := add + 1
 
 /-- info: mov (3 % 2) : Nat -/
 #guard_msgs in #check mov ((3 : Nat) % 2)
+
+/-! ## A category without an escape back to Lean
+
+`aexp` has a rule to switch from `term` into it, but none to switch back. Expressions that
+consist only of `aexp` notations are still printed with them; an expression that contains a
+foreign Lean term is printed as an ordinary Lean term. -/
+
+inductive AExp where
+  | lit (n : Nat)
+  | neg (a : AExp)
+  | plus (a b : AExp)
+
+declare_syntax_cat aexp
+notation "⟦aexp| " e:aexp "⟧" in term => e
+notation n:num in aexp => AExp.lit n
+notation "-" a:aexp in aexp => AExp.neg a
+notation "(" a:aexp " + " b:aexp ")" in aexp => AExp.plus a b
+
+/-- info: ⟦aexp| (1 + -(2 + 3))⟧ : AExp -/
+#guard_msgs in #check ⟦aexp| (1 + -(2 + 3))⟧
+
+/-- info: ⟦aexp| (1 + -2)⟧ : AExp -/
+#guard_msgs in #check AExp.plus (.lit 1) (.neg (.lit 2))
+
+-- Foreign terms: a variable, and a non-numeral argument of `AExp.lit`. Only the expressions that
+-- contain them are printed as Lean terms; `AExp.lit 1` still uses the notation.
+/-- info: fun x => ⟦aexp| 1⟧.plus x : AExp → AExp -/
+#guard_msgs in #check fun x => AExp.plus (.lit 1) x
+
+/-- info: AExp.lit answer : AExp -/
+#guard_msgs in #check AExp.lit answer
