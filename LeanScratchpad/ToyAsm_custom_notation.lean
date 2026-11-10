@@ -1,111 +1,175 @@
 import Lean
 
 /-!
-A toy assembly language embedded in Lean, defined with `cat_notation`, a variant of `notation`
-for custom syntax categories.
+A toy assembly language embedded in Lean, defined with `notation ... in c`, a variant of Lean's
+`notation` for custom syntax categories. `notation items in c => rhs` adds one rule to category
+`c`, and like `notation` it derives parsing (a `syntax` rule plus `macro_rules`) and printing (a
+delaborator) from the single declaration. An item `x:d` is a variable of category `d`.
 
-`cat_notation items : c => rhs` adds one rule to the syntax category `c`. Like `notation`, it
-derives parsing (a `syntax` rule plus `macro_rules`) and printing (an `app_unexpander`) from the
-single declaration. An item `x:d` is a variable of category `d`.
-
-Two kinds of rules are recognized by their shape, because the printer needs them: an entry
-`"[c| " x:c "]" : term => x` (needed if `c` has rules with printers) and an escape
-`"❰" e:term "❱" : c => e` (needed if arguments of category `c` may have to be escaped).
+Every variable must occur on the right-hand side. A rule whose right-hand side is just a variable
+`x:d` is an *identity rule*: it switches from `c` into `d` (so `d` must differ from `c`) and is
+named `c.enter_d`; it also defines `c.enter_d.mk`, which applies the rule to a syntax tree. The
+printer of a rule uses the identity rules declared before it to switch categories: `term.enter_c`
+to show a value of category `c` as a term (required), `c.enter_term` to escape a Lean term inside
+`c`, and `c.enter_num` to show a numeral in `c`. A string is shown in `c` with the rule
+`x:ident in c`. Values that need a missing switch are printed as ordinary Lean terms.
 -/
 
-/-! ## `cat_notation` (generic) -/
+/-! ## `notation ... in c` (generic) -/
 namespace CatNotation
-open Lean Elab Command
+open Lean Elab Command PrettyPrinter Delaborator SubExpr
 
 /-- `ident_str% x` is the identifier `x` as a string literal. -/
 macro "ident_str% " x:ident : term =>
   pure (Syntax.mkStrLit (x.getId.eraseMacroScopes.toString (escape := false)))
-/-- Printing: turns an already printed argument into syntax of category `cat`. `[cat| s]` becomes
-`s`, literals of a pass-through rule of `cat` (`lits`) are kept, anything else is escaped. -/
-def toCat (cat : Name) (lits : Array Name) (esc : String × String) (e : Syntax) : Syntax :=
-  if e.isOfKind (cat ++ `entry) then e[1]
-  else if lits.contains `num && e.isOfKind numLitKind then mkNode (cat ++ `pass ++ `num) #[e]
-  else if let (true, some s) := (lits.contains `ident_str, e.isStrLit?) then
-    mkNode (cat ++ `pass ++ `ident_str) #[mkIdent (.mkSimple s)]
-  else mkNode (cat ++ `escape) #[mkAtom esc.1, e, mkAtom esc.2]
--- printing a `num` variable fails unless the argument is a numeral
-def num? (e : Syntax) : PrettyPrinter.UnexpandM Syntax :=
-  if e.isOfKind numLitKind then pure e else throw ()
-def entry (cat : Name) (tks : String × String) (s : Syntax) : Syntax :=
-  mkNode (cat ++ `entry) #[mkAtom tks.1, s, mkAtom tks.2]
 
-/-- `cat_notation` items: a token, a non-reserved keyword (`&"mov"`), or a variable `x:cat`. -/
-syntax item := str <|> ("&" str) <|> (ident ":" ident)
-syntax "cat_notation " item* " : " ident " => " term : command
+/-- The syntax node kind of an identity rule in category `c` with a variable of category `d`. -/
+def enterKind (c d : Name) : Name := c ++ .mkSimple s!"enter_{d}"
+
+/-- The syntax node kind of any other rule `items in cat`, e.g. `reg.«% num»`. -/
+def kindOf (cat : Name) (items : List String) : Name := cat ++ .mkSimple (" ".intercalate items)
+
+/-! ### Printing (generic delaborator) -/
+
+/-- Shows an argument, already printed as a term, in category `cat`: `term.enter_cat` nodes are
+unwrapped, numerals, strings (as identifiers) and other terms are switched into `cat` with the
+given rules. Fails if the needed rule is missing. -/
+def toCat (cat : Name) (num? str? esc? : Option (Syntax → Syntax)) (e : Syntax) : Option Syntax :=
+  if e.isOfKind (enterKind `term cat) then e.getArgs.find? (!·.isAtom)
+  else if let (some f, true) := (num?, e.isOfKind numLitKind) then some (f e)
+  else if let (some f, some s) := (str?, e.isStrLit?) then some (f (mkIdent (.mkSimple s)))
+  else esc?.map (· e)
+
+def numeral (e : Syntax) : Option Syntax := if e.isOfKind numLitKind then some e else none
+
+/-- An item of a printed rule: a token, or the argument with the given index, converted. -/
+inductive Out where
+  | tok (s : String)
+  | arg (i : Nat) (conv : Syntax → Option Syntax)
+
+/-- Prints an application of a rule's head constant to `arity` arguments as rule `kind`, and
+switches the result into `term` with `enter`. -/
+def delabRule (arity : Nat) (kind : Name) (enter : Syntax → Syntax) (items : Array Out) :
+    Delab := do
+  guard ((← getExpr).getAppNumArgs == arity)
+  let args ← items.mapM fun
+    | .tok s => pure (mkAtom s)
+    | .arg i conv => do
+      let some s := conv (← withNaryArg i delab) | failure
+      pure s
+  return ⟨enter (mkNode kind args)⟩
+
+/-! ### The command -/
+
+/-- Items: a token or a variable `x:cat`. -/
+syntax item := str <|> (ident ":" ident)
+syntax "notation " item* " in " ident " => " term : command
 
 inductive Item where
-  | tok (s : String) (nonReserved : Bool)
+  | tok (s : StrLit)
   | var (x : Ident) (cat : Name)
+
 def Item.ofSyntax (stx : Syntax) : Item :=
   let a := stx[0]
-  if let some s := a.isStrLit? then .tok s false
-  else if a[0].isAtom then .tok (a[1].isStrLit?.getD "") true
+  if a.isOfKind strLitKind then .tok ⟨a⟩
   else .var ⟨a[0]⟩ a[2].getId.eraseMacroScopes
 
+def Item.token? : Item → Option String
+  | .tok s => some s.getString.trimAscii.toString
+  | .var .. => none
+
+/-- A rule `items in cat => rhs` whose syntax node kind is `kind`. -/
+structure Rule where
+  cat : Name
+  items : Array Item
+  rhs : Term
+  kind : Name
+  isIdentity : Bool := false
+
+def Rule.varCat? (r : Rule) (x : Syntax) : Option Name := r.items.findSome? fun
+  | .var y d => if y.getId == x.getId then some d else none
+  | _ => none
+
+/-- Checks the rule and determines its kind. -/
+def Rule.mk? (cat : Name) (items : Array Item) (rhs : Term) : CommandElabM Rule := do
+  for item in items do
+    if let .var x _ := item then
+      unless (rhs.raw.find? (·.getId == x.getId)).isSome do
+        throwErrorAt x "variable `{x}` does not occur on the right-hand side"
+  let r : Rule := { cat, items, rhs, kind := .anonymous }
+  if let some d := r.varCat? rhs then
+    if d == cat then throwErrorAt rhs "an identity rule must switch to another category"
+    if (← getEnv).contains (enterKind cat d) then
+      throwError "there already is a notation that switches from `{cat}` to `{d}`"
+    return { r with kind := enterKind cat d, isIdentity := true }
+  return { r with kind := kindOf cat (items.toList.map fun i => i.token?.getD (match i with
+    | .var _ d => d.toString | _ => "")) }
+
+def antiquot (x : Syntax) : Syntax := Syntax.mkAntiquotNode `term x (isPseudoKind := true)
+
+/-- Parsing: the `syntax` rule. -/
+def Rule.elabSyntax (r : Rule) : CommandElabM Unit := do
+  let items : Array (TSyntax `stx) ← r.items.mapM fun
+    | .tok s => `(stx| $s:str)
+    | .var _ d => `(stx| $(mkIdent d):ident)
+  elabCommand (← `(syntax (name := $(mkIdent r.kind)) $[$items]* : $(mkIdent r.cat)))
+
+/-- Translation: a macro that substitutes the variables into `rhs`. -/
+def Rule.elabMacro (r : Rule) : CommandElabM Unit := do
+  let pat : Term := ⟨mkNode r.kind (r.items.map fun i => (i.token?.map mkAtom).getD (match i with
+    | .var x _ => antiquot x | _ => .missing))⟩
+  let rhs : Term := ⟨Id.run <| r.rhs.raw.replaceM fun s =>
+    pure (if (r.varCat? s).isSome then some (antiquot s) else none)⟩
+  elabCommand (← `(macro_rules | `($pat) => ``($rhs)))
+
+/-- Printing an identity rule: `kind.mk`, which applies the rule to a syntax tree. -/
+def Rule.elabBuilder (r : Rule) : CommandElabM Unit := do
+  unless r.isIdentity do return
+  let x := mkIdent `x
+  let args : Array Term ← r.items.mapM fun i => match i.token? with
+    | some s => `(Lean.mkAtom $(quote s))
+    | none => pure x
+  elabCommand (← `(def $(mkIdent (r.kind ++ `mk)) ($x : Lean.Syntax) : Lean.Syntax :=
+    Lean.mkNode $(quote r.kind) #[$args,*]))
+
+/-- Printing any other rule: a delaborator, if `rhs` is a constant applied to distinct variables
+and the switch `term.enter_cat` exists. -/
+def Rule.elabDelab (r : Rule) : CommandElabM Unit := do
+  let (c, args) ← match r.rhs with
+    | `($c:ident $args*) => pure (c, args)
+    | `($c:ident) => pure (c, #[])
+    | _ => return
+  if (r.varCat? c).isSome || args.any fun a => (r.varCat? a).isNone then return
+  let env ← getEnv
+  let builder? (k : Name) : Option Ident :=
+    if env.contains (k ++ `mk) then mkIdent (k ++ `mk) else none
+  let some enter := builder? (enterKind `term r.cat) | return
+  let optTerm (t? : Option Term) : CommandElabM Term := match t? with
+    | some t => `(some $t)
+    | none => `(none)
+  let outs : Array Term ← r.items.mapM fun
+    | .tok s => `(CatNotation.Out.tok $(quote s.getString.trimAscii.toString))
+    | .var x d => do
+      let i := (args.findIdx? fun a : Term => a.raw.getId == x.getId).getD 0
+      let str? : Option Term ← if env.contains (kindOf d ["ident"]) then
+        some <$> `(fun i => Lean.mkNode $(quote (kindOf d ["ident"])) #[i]) else pure none
+      let conv ← if d == `num then `(CatNotation.numeral)
+        else if [`ident, `str, `term].contains d then `(some)
+        else `(CatNotation.toCat $(quote d) $(← optTerm (builder? (enterKind d `num)))
+          $(← optTerm str?) $(← optTerm (builder? (enterKind d `term))))
+      `(CatNotation.Out.arg $(quote i) $conv)
+  let const ← liftTermElabM <| realizeGlobalConstNoOverload c
+  elabCommand (← `(@[delab $(mkIdent (`app ++ const))] def $(mkIdent (r.kind ++ `delab)) :
+      Lean.PrettyPrinter.Delaborator.Delab :=
+    CatNotation.delabRule $(quote args.size) $(quote r.kind) $enter #[$outs,*]))
+
 elab_rules : command
-  | `(cat_notation $items* : $catId => $rhs) => do
-    let cat := catId.getId.eraseMacroScopes
-    let items := items.map (Item.ofSyntax ·.raw)
-    let varCat? (x : Syntax) : Option Name := items.findSome? fun
-      | .var y d => if y.getId == x.getId then some d else none
-      | _ => none
-    -- entries, escapes and pass-through rules (`n:num : c => n`) get names that the printer knows
-    let kind? : Option Name := match rhs with
-      | `($x:ident) => (varCat? x).map fun d =>
-        if cat == `term then d ++ `entry
-        else if d == `term then cat ++ `escape else cat ++ `pass ++ d
-      | `(ident_str% $_) => some (cat ++ `pass ++ `ident_str)
-      | _ => none
-    let kind := kind?.getD (cat ++ .mkSimple s!"r{(← getRef).getPos?.map (·.byteIdx) |>.getD 0}")
-    -- the printer builds entry and escape nodes, so it needs their delimiters
-    if let (some (Item.tok o _), some (Item.tok c _)) := (items[0]?, items.back?) then
-      if ["entry", "escape"].contains kind.getString! then
-        elabCommand (← `(def $(mkIdent (kind ++ `tokens)) : String × String :=
-          ($(quote o.trimAscii.toString), $(quote c.trimAscii.toString))))
-    -- parsing: a `syntax` rule and a macro that substitutes the variables into `rhs`
-    let stxItems : Array (TSyntax `stx) ← items.mapM fun
-      | .tok s false => `(stx| $(Syntax.mkStrLit s):str)
-      | .tok s true => pure ⟨mkNode ``Parser.Syntax.nonReserved #[mkAtom "&", .mkStrLit s]⟩
-      | .var _ d => `(stx| $(mkIdent d):ident)
-    elabCommand (← `(syntax (name := $(mkIdent kind)) $[$stxItems]* : $(mkIdent cat)))
-    let antiquot (x : Syntax) := Syntax.mkAntiquotNode `term x (isPseudoKind := true)
-    let pat : Term := ⟨mkNode kind (items.map fun
-      | .tok s _ => mkAtom s.trimAscii.toString
-      | .var x _ => antiquot x)⟩
-    let qrhs : Term := ⟨Id.run <| rhs.raw.replaceM fun s =>
-      pure (if (varCat? s).isSome then some (antiquot s) else none)⟩
-    elabCommand (← `(macro_rules | `($pat) => ``($qrhs)))
-    -- printing: an unexpander for `rhs = c x₁ ... xₙ` where the `xᵢ` are variables
-    let (c, args) ← match rhs with
-      | `($c:ident $args*) => pure (c, args)
-      | `($c:ident) => pure (c, #[])
-      | _ => return
-    let some lhsArgs := args.mapM fun a => (varCat? a).map fun _ => (⟨antiquot a⟩ : Term)
-      | return
-    if (varCat? c).isSome then return
-    let env ← getEnv
-    let lits (d : Name) : Array Name := match Parser.getParserCategory? env d with
-      | some pc => pc.kinds.foldl (init := #[]) fun acc k _ =>
-        if k.getPrefix == d ++ `pass then acc.push (.mkSimple k.getString!) else acc
-      | none => #[]
-    let outs : Array Term ← items.mapM fun
-      | .tok s _ => `(mkAtom $(quote s.trimAscii.toString))
-      | .var x `num => `((← CatNotation.num? ($x).raw))
-      | .var x d => if [`ident, `str, `term].contains d then `(($x).raw)
-        else `(CatNotation.toCat $(quote d) $(quote (lits d)) $(mkIdent (d ++ `escape ++ `tokens))
-          ($x).raw)
-    let lhs := Syntax.mkApp (← `($$f:ident)) lhsArgs
-    let out ← `(CatNotation.entry $(quote cat) $(mkIdent (cat ++ `entry ++ `tokens))
-      (mkNode $(quote kind) #[$outs,*]))
-    elabCommand (← `(@[app_unexpander $c] def $(mkIdent (kind ++ `unexpand)) :
-        Lean.PrettyPrinter.Unexpander
-      | `($lhs) => do pure (⟨$out⟩ : Lean.Term)
-      | _ => throw ()))
+  | `(notation $items* in $cat => $rhs) => do
+    let r ← Rule.mk? cat.getId.eraseMacroScopes (items.map (Item.ofSyntax ·.raw)) rhs
+    r.elabSyntax
+    r.elabMacro
+    r.elabBuilder
+    r.elabDelab
 
 end CatNotation
 
@@ -129,33 +193,33 @@ structure Program where
   instrs : List Instr
 
 declare_syntax_cat reg
-cat_notation "[reg| " r:reg "]" : term => r
-cat_notation "❰" e:term "❱" : reg => e
-cat_notation "%" n:num : reg => Reg.mk n
+notation "[reg| " r:reg "]" in term => r
+notation "❰" e:term "❱" in reg => e
+notation "%" n:num in reg => Reg.mk n
 
 declare_syntax_cat imm
-cat_notation "❰" e:term "❱" : imm => e
-cat_notation n:num : imm => n
+notation "❰" e:term "❱" in imm => e
+notation n:num in imm => n
 
 declare_syntax_cat label
-cat_notation "❰" e:term "❱" : label => e
-cat_notation l:ident : label => ident_str% l
+notation "❰" e:term "❱" in label => e
+notation l:ident in label => ident_str% l
 
--- `behavior := both`: an instruction starting with an identifier may also start with a keyword
--- such as `mov`, so the keyword rules are tried as well, not only the label rule.
+-- `behavior := both` makes the first token of each rule a non-reserved keyword: `mov`, `add`, ...
+-- stay usable as Lean identifiers, and an instruction starting with an identifier is tried both
+-- as a label and as a keyword rule.
 declare_syntax_cat instr (behavior := both)
-cat_notation "[instr| " i:instr "]" : term => i
-cat_notation "❰" e:term "❱" : instr => e
+notation "[instr| " i:instr "]" in term => i
+notation "❰" e:term "❱" in instr => e
 
--- `&"mov"` etc. are non-reserved keywords, so `mov`, `add`, ... stay usable as Lean identifiers.
-cat_notation l:label ":" : instr => Instr.label l
-cat_notation &"mov " r:reg ", " i:imm : instr => Instr.mov r i
-cat_notation &"add " d:reg ", " s:reg : instr => Instr.add d s
-cat_notation &"dec " r:reg : instr => Instr.dec r
-cat_notation &"jnz " r:reg ", " l:label : instr => Instr.jnz r l
-cat_notation &"halt" : instr => Instr.halt
+notation l:label ":" in instr => Instr.label l
+notation "mov " r:reg ", " i:imm in instr => Instr.mov r i
+notation "add " d:reg ", " s:reg in instr => Instr.add d s
+notation "dec " r:reg in instr => Instr.dec r
+notation "jnz " r:reg ", " l:label in instr => Instr.jnz r l
+notation "halt" in instr => Instr.halt
 
-/-! A program is a sequence of instructions, which `cat_notation` cannot express (just like
+/-! A program is a sequence of instructions, which `notation ... in c` cannot express (just like
 `notation`), so it is defined directly. Each instruction is printed on its own line. -/
 
 syntax "[asm|" ppDedent(ppIndent((ppLine instr)*) ppLine) "]" : term
@@ -163,12 +227,15 @@ syntax "[asm|" ppDedent(ppIndent((ppLine instr)*) ppLine) "]" : term
 macro_rules
   | `([asm| $is*]) => `(Program.mk [$[[instr| $is]],*])
 
-@[app_unexpander Program.mk] def unexpandProgram : Lean.PrettyPrinter.Unexpander
-  | `($_ [$is,*]) => do
-    let is : Array (Lean.TSyntax `instr) := is.getElems.map
-      (⟨CatNotation.toCat `instr #[] instr.escape.tokens ·⟩)
-    `([asm| $[$is]*])
-  | _ => throw ()
+open Lean PrettyPrinter Delaborator SubExpr in
+@[delab app.Program.mk] def delabProgram : Delab := do
+  guard ((← getExpr).getAppNumArgs == 1)
+  let `([$is,*]) ← withAppArg delab | failure
+  let is : Array (TSyntax `instr) ←
+    is.getElems.mapM fun i => do
+      let some i := CatNotation.toCat `instr none none (some instr.enter_term.mk) i | failure
+      return ⟨i⟩
+  `([asm| $[$is]*])
 
 /-! ## Single instructions -/
 
@@ -209,7 +276,7 @@ def stop : Instr := .halt
 /-- info: [instr| mov %0, 1] : Instr -/
 #guard_msgs in #check Instr.mov ⟨0⟩ 1
 
-/-- info: [instr| jnz ❰Reg.mk answer❱, done] : Instr -/
+/-- info: [instr| jnz ❰{ idx := answer }❱, done] : Instr -/
 #guard_msgs in #check Instr.jnz ⟨answer⟩ "done"
 
 /-! ## Programs -/
@@ -265,6 +332,63 @@ info: [asm|
 -/
 #guard_msgs in
 #check [asm|]
+
+/-! ## Other concrete syntax for switching categories
+
+Nothing about `[c| ... ]` or `❰e❱` is built in: conditions are entered with `⟦cond| ... ⟧`, and
+have no escape back to Lean. -/
+
+inductive Cond where
+  | zero
+  | nonzero (r : Reg)
+  | not (c : Cond)
+
+declare_syntax_cat cond
+notation "⟦cond| " c:cond "⟧" in term => c
+notation "=0" in cond => Cond.zero
+notation "≠0 " r:reg in cond => Cond.nonzero r
+notation "¬ " c:cond in cond => Cond.not c
+
+def always : Cond := .not .zero
+
+/-- info: ⟦cond| ¬ ≠0 %2⟧ : Cond -/
+#guard_msgs in #check ⟦cond| ¬ ≠0 %2⟧
+
+-- `always` would need an escape, which `cond` does not have.
+/-- info: always.not : Cond -/
+#guard_msgs in #check Cond.not always
+
+/-- info: ⟦cond| ≠0 ❰scratch❱⟧ : Cond -/
+#guard_msgs in #check ⟦cond| ≠0 ❰scratch❱⟧
+
+/-! ## Rejected rules -/
+
+/-- error: variable `r` does not occur on the right-hand side -/
+#guard_msgs in notation "nop " r:reg in instr => Instr.halt
+
+/-- error: an identity rule must switch to another category -/
+#guard_msgs in notation "(" r:reg ")" in reg => r
+
+-- A second notation for the same category switch would make printing ambiguous.
+/-- error: there already is a notation that switches from `reg` to `term` -/
+#guard_msgs in notation "<<" e:term ">>" in reg => e
+
+/-- error: there already is a notation that switches from `term` to `cond` -/
+#guard_msgs in notation "⦃" c:cond "⦄" in term => c
+
+/-! ## Lean's `notation` is unaffected -/
+
+def pairUp (a b : Nat) : Nat × Nat := (a, b)
+def double (n : Nat) : Nat := 2 * n
+
+notation "⟪pair " a ", " b "⟫" => pairUp a b
+local notation:max "dbl " n:max => double n
+
+/-- info: ⟪pair 1, 2⟫ : Nat × Nat -/
+#guard_msgs in #check pairUp 1 2
+
+/-- info: dbl 3 : Nat -/
+#guard_msgs in #check double 3
 
 -- Lean's own syntax is unaffected.
 def mov (add : Nat) : Nat := add + 1
