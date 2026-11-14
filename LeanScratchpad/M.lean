@@ -92,10 +92,9 @@ But eg "intro" will automatically preprocess intro'd hyps
 
 
 set_option trace.grind.hom true
-example (x : UInt16) : (h : x < 100) →  x + y = 0 := by sym =>
+example (x : UInt16) : (h : x < 100) →  x < 101 := by sym =>
   intro h
-  --by_contra
-  done
+  lia
 
 
 
